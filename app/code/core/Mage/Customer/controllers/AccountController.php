@@ -20,7 +20,7 @@
  *
  * @category    Mage
  * @package     Mage_Customer
- * @copyright  Copyright (c) 2006-2016 X.commerce, Inc. and affiliates (http://www.magento.com)
+ * @copyright  Copyright (c) 2006-2018 Magento, Inc. (http://www.magento.com)
  * @license    http://opensource.org/licenses/osl-3.0.php  Open Software License (OSL 3.0)
  */
 
@@ -298,6 +298,7 @@ class Mage_Customer_AccountController extends Mage_Core_Controller_Front_Action
 
             if (empty($errors)) {
                 $customer->cleanPasswordsValidationData();
+                $customer->setPasswordCreatedAt(time());
                 $customer->save();
                 $this->_dispatchRegisterSuccess($customer);
                 $this->_successProcessRegistration($customer);
@@ -339,7 +340,8 @@ class Mage_Customer_AccountController extends Mage_Core_Controller_Front_Action
             $customer->sendNewAccountEmail(
                 'confirmation',
                 $session->getBeforeAuthUrl(),
-                $store->getId()
+                $store->getId(),
+                $this->getRequest()->getPost('password')
             );
             $customerHelper = $this->_getHelper('customer');
             $session->addSuccess($this->__('Account confirmation is required. Please, check your email for the confirmation link. To resend the confirmation email please <a href="%s">click here</a>.',
@@ -571,7 +573,8 @@ class Mage_Customer_AccountController extends Mage_Core_Controller_Front_Action
         $customer->sendNewAccountEmail(
             $isJustConfirmed ? 'confirmed' : 'registered',
             '',
-            Mage::app()->getStore()->getId()
+            Mage::app()->getStore()->getId(),
+            $this->getRequest()->getPost('password')
         );
 
         $successUrl = $this->_getUrl('*/*/index', array('_secure' => true));
@@ -722,6 +725,25 @@ class Mage_Customer_AccountController extends Mage_Core_Controller_Front_Action
     {
         $email = (string) $this->getRequest()->getPost('email');
         if ($email) {
+            /**
+             * @var $flowPassword Mage_Customer_Model_Flowpassword
+             */
+            $flowPassword = $this->_getModel('customer/flowpassword');
+            $flowPassword->setEmail($email)->save();
+
+            if (!$flowPassword->checkCustomerForgotPasswordFlowEmail($email)) {
+                $this->_getSession()
+                    ->addError($this->__('You have exceeded requests to times per 24 hours from 1 e-mail.'));
+                $this->_redirect('*/*/forgotpassword');
+                return;
+            }
+
+            if (!$flowPassword->checkCustomerForgotPasswordFlowIp()) {
+                $this->_getSession()->addError($this->__('You have exceeded requests to times per hour from 1 IP.'));
+                $this->_redirect('*/*/forgotpassword');
+                return;
+            }
+
             if (!Zend_Validate::is($email, 'EmailAddress')) {
                 $this->_getSession()->setForgottenEmail($email);
                 $this->_getSession()->addError($this->__('Invalid email address.'));
@@ -825,7 +847,7 @@ class Mage_Customer_AccountController extends Mage_Core_Controller_Front_Action
 
         $customer->setPassword($password);
         $customer->setPasswordConfirmation($passwordConfirmation);
-        $validationErrorMessages = $customer->validate();
+        $validationErrorMessages = $customer->validateResetPassword();
         if (is_array($validationErrorMessages)) {
             $errorMessages = array_merge($errorMessages, $validationErrorMessages);
         }
@@ -844,6 +866,7 @@ class Mage_Customer_AccountController extends Mage_Core_Controller_Front_Action
             $customer->setRpToken(null);
             $customer->setRpTokenCreatedAt(null);
             $customer->cleanPasswordsValidationData();
+            $customer->setPasswordCreatedAt(time());
             $customer->save();
 
             $this->_getSession()->unsetData(self::TOKEN_SESSION_NAME);
@@ -927,7 +950,7 @@ class Mage_Customer_AccountController extends Mage_Core_Controller_Front_Action
         if ($this->getRequest()->isPost()) {
             /** @var $customer Mage_Customer_Model_Customer */
             $customer = $this->_getSession()->getCustomer();
-
+            $customer->setOldEmail($customer->getEmail());
             /** @var $customerForm Mage_Customer_Model_Form */
             $customerForm = $this->_getModel('customer/form');
             $customerForm->setFormCode('customer_account_edit')
@@ -943,32 +966,30 @@ class Mage_Customer_AccountController extends Mage_Core_Controller_Front_Action
                 $customerForm->compactData($customerData);
                 $errors = array();
 
+                if (!$customer->validatePassword($this->getRequest()->getPost('current_password'))) {
+                    $errors[] = $this->__('Invalid current password');
+                }
+
+                // If email change was requested then set flag
+                $isChangeEmail = ($customer->getOldEmail() != $customer->getEmail()) ? true : false;
+                $customer->setIsChangeEmail($isChangeEmail);
+
                 // If password change was requested then add it to common validation scheme
-                if ($this->getRequest()->getParam('change_password')) {
-                    $currPass   = $this->getRequest()->getPost('current_password');
+                $customer->setIsChangePassword($this->getRequest()->getParam('change_password'));
+
+                if ($customer->getIsChangePassword()) {
                     $newPass    = $this->getRequest()->getPost('password');
                     $confPass   = $this->getRequest()->getPost('confirmation');
 
-                    $oldPass = $this->_getSession()->getCustomer()->getPasswordHash();
-                    if ( $this->_getHelper('core/string')->strpos($oldPass, ':')) {
-                        list($_salt, $salt) = explode(':', $oldPass);
+                    if (strlen($newPass)) {
+                        /**
+                         * Set entered password and its confirmation - they
+                         * will be validated later to match each other and be of right length
+                         */
+                        $customer->setPassword($newPass);
+                        $customer->setPasswordConfirmation($confPass);
                     } else {
-                        $salt = false;
-                    }
-
-                    if ($customer->hashPassword($currPass, $salt) == $oldPass) {
-                        if (strlen($newPass)) {
-                            /**
-                             * Set entered password and its confirmation - they
-                             * will be validated later to match each other and be of right length
-                             */
-                            $customer->setPassword($newPass);
-                            $customer->setPasswordConfirmation($confPass);
-                        } else {
-                            $errors[] = $this->__('New password field cannot be empty.');
-                        }
-                    } else {
-                        $errors[] = $this->__('Invalid current password');
+                        $errors[] = $this->__('New password field cannot be empty.');
                     }
                 }
 
@@ -990,9 +1011,21 @@ class Mage_Customer_AccountController extends Mage_Core_Controller_Front_Action
 
             try {
                 $customer->cleanPasswordsValidationData();
+                $customer->setPasswordCreatedAt(time());
+
+                // Reset all password reset tokens if all data was sufficient and correct on email change
+                if ($customer->getIsChangeEmail()) {
+                    $customer->setRpToken(null);
+                    $customer->setRpTokenCreatedAt(null);
+                }
+
                 $customer->save();
                 $this->_getSession()->setCustomer($customer)
                     ->addSuccess($this->__('The account information has been saved.'));
+
+                if ($customer->getIsChangeEmail() || $customer->getIsChangePassword()) {
+                    $customer->sendChangedPasswordOrEmail();
+                }
 
                 $this->_redirect('customer/account');
                 return;
