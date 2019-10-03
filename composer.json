@@ -1,7 +1,7 @@
 {
-    "name": "OpenMageModuleFostering\/Mage_Core_Modules",
+    "name": "openmage-module-fostering\/mage_core_modules",
     "type": "magento-module",
-    "license": "OSL-v3.0",
+    "license": "OSL-3.0",
     "homepage": "",
     "description": "Collection of Magento Core Modules",
     "authors": [
